@@ -65,9 +65,16 @@ def add_gradient_noise(t, stddev=1e-3, name=None):
         gn = tf.random_normal(tf.shape(t), stddev=stddev)
         return tf.add(t, gn, name=name)
 
-class MemN2N(object):
+class MemN2N_Dialog(object):
     """End-To-End Memory Network."""
-    def __init__(self, batch_size, vocab_size, sentence_size, memory_size, embedding_size,
+    def __init__(self, 
+        batch_size, 
+        vocab_size, 
+        sentence_size, 
+        memory_size, 
+        embedding_size,
+        answer_n_hot,
+        match=False,
         weight_tying="adj",
         hops=3,
         max_grad_norm=40.0,
@@ -77,7 +84,7 @@ class MemN2N(object):
         global_step=None,
         encoding=position_encoding,
         session=tf.Session(),
-        name='MemN2N'):
+        name='MemN2N_Dialog'):
         """Creates an End-To-End Memory Network
 
         Args:
@@ -118,6 +125,11 @@ class MemN2N(object):
         self._sentence_size = sentence_size
         self._memory_size = memory_size
         self._embedding_size = embedding_size
+        assert len(answer_n_hot.shape) == 2 # 2D matrix
+        assert answer_n_hot.shape[0] == self._vocab_size
+        self._answer_n_hot = tf.constant(answer_n_hot, dtype=tf.float32, name="answer_n_hot")
+        self._nb_answers = answer_n_hot.shape[1]
+        self._match = match
         self._weight_tying = weight_tying
         self._hops = hops
         self._max_grad_norm = max_grad_norm
@@ -138,16 +150,18 @@ class MemN2N(object):
                                 self._stories, 
                                 self._queries, 
                                 self._temporal, 
-                                self._linear_start
-                    ) # (batch_size, vocab_size)
+                                self._linear_start,
+                                self._match_features if self._match else None
+                    ) # (batch_size, nb_answers)
         elif self._weight_tying == "lw":
             self._build_vars_lw()
             logits = self._inference_lw(
                                 self._stories, 
                                 self._queries, 
                                 self._temporal, 
-                                self._linear_start
-                    ) # (batch_size, vocab_size)
+                                self._linear_start,
+                                self._match_features if self._match else None
+                    ) # (batch_size, nb_answers)
         else:
             raise # not implemented
         cross_entropy = tf.nn.softmax_cross_entropy_with_logits(logits, tf.cast(self._answers, tf.float32), name="cross_entropy")
@@ -188,10 +202,12 @@ class MemN2N(object):
     def _build_inputs(self):
         self._stories = tf.placeholder(tf.int32, [None, self._memory_size, self._sentence_size], name="stories")
         self._queries = tf.placeholder(tf.int32, [None, self._sentence_size], name="queries")
-        self._answers = tf.placeholder(tf.int32, [None, self._vocab_size], name="answers")
+#         self._answers = tf.placeholder(tf.int32, [None, self._vocab_size], name="answers")
+        self._answers = tf.placeholder(tf.int32, [None, self._nb_answers], name="answers")
         self._temporal = tf.placeholder(tf.int32, [None, self._memory_size], name="temproal")
         self._linear_start = tf.placeholder(tf.bool, [], name="linear_start")
-
+        self._match_features = tf.placeholder(tf.float32, [None, 7, self._nb_answers], name="match_features")
+        
     def _build_vars_adj(self):
         with tf.variable_scope(self._name):
             nil_word_slot = tf.zeros([1, self._embedding_size])
@@ -211,9 +227,17 @@ class MemN2N(object):
                 TC = tf.concat(0, [ nil_word_slot, self._init([self._memory_size, self._embedding_size]) ])
                 self._T_weight_matrices.append(tf.Variable(TC, name='TC'))
 
+            self.Wa = tf.Variable(
+                self._init([
+                    self._embedding_size, 
+                    self._vocab_size + (7 if self._match else 0)
+                ]), 
+                name="Wa"
+            )
+
         self._nil_vars = set([mat.name for mat in self._weight_matrices + self._T_weight_matrices])
 
-    def _inference_adj(self, stories, queries, temporal, linear_start):
+    def _inference_adj(self, stories, queries, temporal, linear_start, match_features=None):
         with tf.variable_scope(self._name):
             q_emb = tf.nn.embedding_lookup(self._weight_matrices[0], queries)
             u_0 = tf.reduce_sum(q_emb * self._encoding, 1)
@@ -244,7 +268,15 @@ class MemN2N(object):
 
                 u.append(u_k)
 
-            return tf.matmul(u_k, tf.transpose(self._weight_matrices[-1]))
+            if self._match:
+                answer_n_hot_concat = self._concat_match_features(
+                    self._answer_n_hot, match_features
+                )
+                return self._choose_response_with_match(
+                    u[-1], self.Wa, answer_n_hot_concat
+                )
+            else:
+                return tf.matmul(tf.matmul(u_k, self.Wa), self._answer_n_hot)
 
     def _build_vars_lw(self):
         with tf.variable_scope(self._name):
@@ -262,10 +294,17 @@ class MemN2N(object):
             self.TC = tf.Variable(TC, name='TC')
 
             self.H = tf.Variable(self._init([self._embedding_size, self._embedding_size]), name="H")
-            self.W = tf.Variable(self._init([self._embedding_size, self._vocab_size]), name="W")
+#             self.W = tf.Variable(self._init([self._embedding_size, self._vocab_size]), name="W")
+            self.Wa = tf.Variable(
+                self._init([
+                    self._embedding_size, 
+                    self._vocab_size + (7 if self._match else 0)
+                ]), 
+                name="Wa"
+            )
         self._nil_vars = set([self.A.name, self.B.name, self.C.name, self.TA.name, self.TC.name])
 
-    def _inference_lw(self, stories, queries, temporal, linear_start):
+    def _inference_lw(self, stories, queries, temporal, linear_start, match_features=None):
         with tf.variable_scope(self._name):
             q_emb = tf.nn.embedding_lookup(self.B, queries)
             u_0 = tf.reduce_sum(q_emb * self._encoding, 1)
@@ -295,10 +334,46 @@ class MemN2N(object):
                     u_k = self._nonlin(u_k)
 
                 u.append(u_k)
+            
+            if self._match:
+                answer_n_hot_concat = self._concat_match_features(
+                    self._answer_n_hot, match_features
+                )
+                return self._choose_response_with_match(
+                    u[-1], self.Wa, answer_n_hot_concat
+                )
+            else:
+                return tf.matmul(tf.matmul(u_k, self.Wa), self._answer_n_hot)
 
-            return tf.matmul(u_k, self.W)
+    def _concat_match_features(self, answer_n_hot, match_features):
+        batch_size = tf.shape(match_features)[0]
+        answer_n_hot_expanded = tf.expand_dims(answer_n_hot, dim=0)
+        # answer_n_hot_expanded: [1, vocab_size, nb_answers]
+        answer_n_hot_tiled = tf.tile(answer_n_hot_expanded, [batch_size, 1, 1])
+        # answer_n_hot_tiled: [None, vocab_size, nb_answers]
+        return tf.concat(1, [answer_n_hot_tiled, match_features])
+        # return: [None, vocab_size + 7, nb_answers]
 
-    def batch_fit(self, stories, queries, answers, temporal, linear_start):
+    def _choose_response_with_match(self, u, Wa, answer_n_hot_concat):
+        '''
+        Args: 
+            u: [None, embedding_size]
+            Wa: [embedding_size, vocab_size + 7]
+            answer_n_hot_concat: [None, vocab_size + 7, nb_answers]
+        Returns:
+            res: [None, nb_answers]
+        '''
+        u_Wa = tf.matmul(u, Wa) 
+        # u_Wa: [None, vocab_size + 7]
+        u_Wa_expanded = tf.expand_dims(u_Wa, dim=1)
+        # u_Wa_expanded: [None, 1, vocab_size + 7]
+        res = tf.batch_matmul(u_Wa_expanded, answer_n_hot_concat)
+        # res: [None, 1, nb_answers]
+        res = tf.reduce_sum(res, 1)
+        # res: [None, nb_answers]
+        return res  
+
+    def batch_fit(self, stories, queries, answers, temporal, linear_start, match_features=None):
         """Runs the training algorithm over the passed batch
 
         Args:
@@ -309,17 +384,28 @@ class MemN2N(object):
         Returns:
             loss: floating-point number, the loss computed for the batch
         """
-        feed_dict = {
-            self._stories: stories, 
-            self._queries: queries, 
-            self._answers: answers, 
-            self._temporal: temporal,
-            self._linear_start: linear_start
-        }
+        if self._match:
+            assert match_features is not None
+            feed_dict = {
+                self._stories: stories, 
+                self._queries: queries, 
+                self._answers: answers, 
+                self._temporal: temporal,
+                self._linear_start: linear_start,
+                self._match_features: match_features
+            }
+        else:
+            feed_dict = {
+                self._stories: stories, 
+                self._queries: queries, 
+                self._answers: answers, 
+                self._temporal: temporal,
+                self._linear_start: linear_start,
+            }
         loss, _ = self._sess.run([self.loss_op, self.train_op], feed_dict=feed_dict)
         return loss
-
-    def predict(self, stories, queries, temporal, linear_start):
+    
+    def batch_predict(self, stories, queries, temporal, linear_start, match_features=None):
         """Predicts answers as one-hot encoding.
 
         Args:
@@ -329,13 +415,61 @@ class MemN2N(object):
         Returns:
             answers: Tensor (None, vocab_size)
         """
+        if self._match:
+            assert match_features is not None
         feed_dict = {
             self._stories: stories, 
             self._queries: queries, 
             self._temporal: temporal,
-            self._linear_start: linear_start
+            self._linear_start: linear_start,
+            self._match_features: match_features
         }
         return self._sess.run(self.predict_op, feed_dict=feed_dict)
+
+    def _split_into_groups(self, l, n):
+        """Yield successive n-sized chunks from l."""
+        for i in xrange(0, len(l), n):
+            yield l[i:i + n]
+            
+    def predict(self, stories, queries, temporal, linear_start, match_features=None):
+        """Predicts answers as one-hot encoding.
+
+        Args:
+            stories: Tensor (None, memory_size, sentence_size)
+            queries: Tensor (None, sentence_size)
+
+        Returns:
+            answers: Tensor (None, vocab_size)
+        """
+        story_batches = self._split_into_groups(stories, self._batch_size)
+        query_batches = self._split_into_groups(queries, self._batch_size)
+        temporal_batches = self._split_into_groups(temporal, self._batch_size)
+        match_batches = None
+        predictions = []
+        if self._match:
+            assert match_features is not None
+            match_batches = self._split_into_groups(match_features, self._batch_size)
+            for story_batch, query_batch, temporal_batch, match_batch in zip(story_batches, query_batches, temporal_batches, match_batches):
+                feed_dict = {
+                    self._stories: story_batch, 
+                    self._queries: query_batch, 
+                    self._temporal: temporal_batch,
+                    self._linear_start: linear_start,
+                    self._match_features: match_batch,
+                }
+                pred = self._sess.run(self.predict_op, feed_dict=feed_dict)
+                predictions.extend(pred)
+        else:
+            for story_batch, query_batch, temporal_batch in zip(story_batches, query_batches, temporal_batches):
+                feed_dict = {
+                    self._stories: story_batch, 
+                    self._queries: query_batch, 
+                    self._temporal: temporal_batch,
+                    self._linear_start: linear_start,
+                }
+                pred = self._sess.run(self.predict_op, feed_dict=feed_dict)
+                predictions.extend(pred)
+        return predictions
 
     def predict_proba(self, stories, queries):
         """Predicts probabilities of answers.

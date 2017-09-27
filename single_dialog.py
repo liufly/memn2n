@@ -3,9 +3,9 @@ Download tasks from facebook.ai/babi """
 from __future__ import absolute_import
 from __future__ import print_function
 
-from data_utils import load_task, vectorize_data
+from data_utils_dialog import load_task, vectorize_data, parse_kb
 from sklearn import cross_validation, metrics
-from memn2n import MemN2N
+from memn2n import MemN2N_Dialog
 from itertools import chain
 from six.moves import range, reduce
 
@@ -26,7 +26,7 @@ tf.flags.DEFINE_integer("embedding_size", 20, "Embedding size for embedding matr
 tf.flags.DEFINE_integer("memory_size", 50, "Maximum size of memory.")
 tf.flags.DEFINE_integer("task_id", 1, "bAbI task id, 1 <= id <= 20")
 tf.flags.DEFINE_integer("random_state", None, "Random state.")
-tf.flags.DEFINE_string("data_dir", "data/tasks_1-20_v1-2/en/", "Directory containing bAbI tasks")
+tf.flags.DEFINE_string("data_dir", "data/dialog-bAbI-tasks-converted/", "Directory containing bAbI-dialog tasks")
 tf.flags.DEFINE_string("opt", "sgd_anneal", "Optimizer, 'sgd_anneal' or 'adam' [sgd_anneal]")
 tf.flags.DEFINE_integer("anneal_period", 25, "Anneal period [25]")
 tf.flags.DEFINE_float("anneal_ratio", 0.5, "Anneal ratio [0.5]")
@@ -34,6 +34,9 @@ tf.flags.DEFINE_float("random_time", 0.1, "Random time [0.1]")
 tf.flags.DEFINE_boolean("linear_start", False, "Linear start [False]")
 tf.flags.DEFINE_integer("ls_epoch", 20, "Linear start ending epoch [20]")
 tf.flags.DEFINE_string("weight_tying", "adj", "Weight tying, adjacent 'adj' or layer-wise 'lw' [adj]")
+tf.flags.DEFINE_boolean("oov", False, "Test on the OOV set [False]")
+tf.flags.DEFINE_boolean("match", False, "Use the match features [False]")
+tf.flags.DEFINE_string("kb_file", "data/dialog-bAbI-tasks-converted/dialog-babi-kb-all.txt", "KB file path")
 FLAGS = tf.flags.FLAGS
 
 def get_temporal_encoding(d, random_time=0.):
@@ -41,15 +44,64 @@ def get_temporal_encoding(d, random_time=0.):
     for i in range(len(d)):
         l = int(np.sign(d[i].sum(axis=1)).sum())
         temporal_encoding = np.zeros(d.shape[1])
-        if random_time > 0.:
-            nblank = np.random.randint(0, np.ceil(l * random_time) + 1)
-            rt = np.random.permutation(l + nblank) + 1 # +1: permutation starts from 0
-            rt = np.vectorize(lambda x: d.shape[1] if x > d.shape[1] else x)(rt)
-            temporal_encoding[:l] = np.sort(rt[:l])[::-1]
-        else:
-            temporal_encoding[:l] = np.arange(l, 0, -1)
+        if l != 0:
+            if random_time > 0.:
+                nblank = np.random.randint(0, np.ceil(l * random_time) + 1)
+                rt = np.random.permutation(l + nblank) + 1 # +1: permutation starts from 0
+                rt = np.vectorize(lambda x: d.shape[1] if x > d.shape[1] else x)(rt)
+                temporal_encoding[:l] = np.sort(rt[:l])[::-1]
+            else:
+                temporal_encoding[:l] = np.arange(l, 0, -1)
         te.append(temporal_encoding)
     return te
+
+def get_answer_dict(data):
+    ans_dict = {}
+    for d in data:
+        story, question, answer = d
+        a = ' '.join(answer)
+        if a not in ans_dict:
+            ans_dict[a] = len(ans_dict)
+    return ans_dict
+
+kb_types = [
+    'R_cuisine',
+    'R_location',
+    'R_price',
+    'R_rating',
+    'R_phone',
+    'R_address',
+    'R_number',
+]
+
+def get_kb_type_idx(t):
+    assert t in kb_types
+    return kb_types.index(t)
+
+def get_kb_type(kb, word):
+    for t, v in kb.iteritems():
+        if word in v:
+            return t
+    return None
+
+def find_match_in_story(word, story):
+    for s in story:
+        if word in s:
+            return True
+    return False
+
+def create_match_features(data, idx2ans, kb):
+    ret = np.zeros((len(data), 7, len(idx2ans)))
+    for i, (story, _, _) in enumerate(data):
+        for j in range(len(idx2ans)):
+            a = idx2ans[j].split(' ')
+            m = np.zeros(7)
+            for w in a:
+                kb_type = get_kb_type(kb, w)
+                if kb_type and find_match_in_story(w, story):
+                    m[get_kb_type_idx(kb_type)] = 1
+            ret[i, :, j] = m
+    return ret
 
 if __name__ == "__main__":
     logger = logging.getLogger()
@@ -63,12 +115,26 @@ if __name__ == "__main__":
     logger.info(" ".join(sys.argv))
     logger.info("Started Task: %d" % FLAGS.task_id)
     
+    kb = parse_kb(FLAGS.kb_file)
+    
     # task data
-    train, test = load_task(FLAGS.data_dir, FLAGS.task_id)
-    data = train + test
+    if FLAGS.task_id != 6:
+        train, dev, test, testOOV = load_task(FLAGS.data_dir, FLAGS.task_id)
+        if FLAGS.oov:
+            logger.info("Using the OOV set")
+            test = testOOV
+    else:
+        train, dev, test = load_task(FLAGS.data_dir, FLAGS.task_id)
+        if FLAGS.oov:
+            logger.warning("No OOV set for dialog task 6, using the test set instead")
+    data = train + dev + test
+        
+    ans2idx = get_answer_dict(data)
+    idx2ans = dict(zip(ans2idx.values(), ans2idx.keys()))
     
     vocab = sorted(reduce(lambda x, y: x | y, (set(list(chain.from_iterable(s)) + q + a) for s, q, a in data)))
     word_idx = dict((c, i + 1) for i, c in enumerate(vocab))
+    idx_word = dict(zip(word_idx.values(), word_idx.keys()))
     
     max_story_size = max(map(len, (s for s, _, _ in data)))
     mean_story_size = int(np.mean([ len(s) for s, _, _ in data ]))
@@ -78,16 +144,56 @@ if __name__ == "__main__":
     vocab_size = len(word_idx) + 1 # +1 for nil word
     sentence_size = max(query_size, sentence_size) # for the position
     
+    # create answer n-hot matrix (|V| x |C|)
+    answer_n_hot = np.zeros((vocab_size, len(ans2idx)))
+    for ans_it in range(len(idx2ans)):
+        ans = idx2ans[ans_it]
+        n_hot = np.zeros((vocab_size, ))
+        for w in ans.split(' '):
+            assert w in word_idx
+            n_hot[word_idx[w]] = 1
+        answer_n_hot[:, ans_it] = n_hot
+        
     logger.info("Longest sentence length %d" % sentence_size)
     logger.info("Longest story length %d" % max_story_size)
     logger.info("Average story length %d" % mean_story_size)
     
     # train/validation/test sets
-    S, Q, A = vectorize_data(train, word_idx, sentence_size, memory_size)
-    trainS, valS, trainQ, valQ, trainA, valA = cross_validation.train_test_split(S, Q, A, test_size=.1, random_state=FLAGS.random_state)
-    testS, testQ, testA = vectorize_data(test, word_idx, sentence_size, memory_size)
+    trainS, trainQ, trainA = vectorize_data(train, word_idx, sentence_size, memory_size, ans2idx)
+    valS, valQ, valA = vectorize_data(dev, word_idx, sentence_size, memory_size, ans2idx)
+    testS, testQ, testA = vectorize_data(test, word_idx, sentence_size, memory_size, ans2idx)
+
+    trainM, valM, testM = None, None, None
     
-    logger.info("Training set shape " + str(trainS.shape))
+    if FLAGS.match:
+        logger.info("Building match features for training set ...")
+        trainM = create_match_features(train, idx2ans, kb)
+        logger.info("Done")
+        logger.info("Building match features for validation set ...")
+        valM = create_match_features(dev, idx2ans, kb)
+        logger.info("Done")
+        logger.info("Building match features for test set ...")
+        testM = create_match_features(test, idx2ans, kb)
+        logger.info("Done")
+    
+    logger.info("Training story set shape " + str(trainS.shape))
+    logger.info("Training question set shape " + str(trainQ.shape))
+    logger.info("Training answer set shape " + str(trainA.shape))
+    
+    logger.info("Validation story set shape " + str(valS.shape))
+    logger.info("Validation question set shape " + str(valQ.shape))
+    logger.info("Validation answer set shape " + str(valA.shape))
+    
+    logger.info("Test story set shape " + str(testS.shape))
+    logger.info("Test question set shape " + str(testQ.shape))
+    logger.info("Test answer set shape " + str(testA.shape))
+    
+#     tsetOOVS, testOOVQ, testOOVA = None, None, None
+#     if FLAGS.task_id != 6:
+#         testOOVS, testOOVQ, testOOVA = vectorize_data(testOOV, word_idx, sentence_size, memory_size, ans2idx)
+#         logger.info("Test OOV story set shape " + str(testOOVS.shape))
+#         logger.info("Test OOV question set shape " + str(testOOVQ.shape))
+#         logger.info("Test OOV answer set shape " + str(testOOVA.shape))
     
     # params
     n_train = trainS.shape[0]
@@ -128,12 +234,14 @@ if __name__ == "__main__":
     last_train_acc, last_val_acc = None, None
     
     with tf.Session() as sess:
-        model = MemN2N(
+        model = MemN2N_Dialog(
                     batch_size, 
                     vocab_size, 
                     sentence_size, 
                     memory_size, 
-                    FLAGS.embedding_size, 
+                    FLAGS.embedding_size,
+                    answer_n_hot,
+                    match=FLAGS.match,
                     session=sess,
                     weight_tying=FLAGS.weight_tying,
                     hops=FLAGS.hops, 
@@ -151,8 +259,9 @@ if __name__ == "__main__":
                 s = trainS[start:end]
                 q = trainQ[start:end]
                 a = trainA[start:end]
+                m = trainM[start:end] if FLAGS.match else None
                 temporal = get_temporal_encoding(s, random_time=FLAGS.random_time)
-                cost_t = model.batch_fit(s, q, a, temporal, linear_start)
+                cost_t = model.batch_fit(s, q, a, temporal, linear_start, m)
                 total_cost += cost_t
     
             if t % FLAGS.evaluation_interval == 0:
@@ -161,11 +270,12 @@ if __name__ == "__main__":
                     end = start + batch_size
                     s = trainS[start:end]
                     q = trainQ[start:end]
+                    m = trainM[start:end] if FLAGS.match else None
                     temporal = get_temporal_encoding(s, random_time=0.0)
-                    pred = model.predict(s, q, temporal, linear_start)
+                    pred = model.predict(s, q, temporal, linear_start, m)
                     train_preds += list(pred)
     
-                val_preds = model.predict(valS, valQ, get_temporal_encoding(valS, random_time=0.0), linear_start)
+                val_preds = model.predict(valS, valQ, get_temporal_encoding(valS, random_time=0.0), linear_start, valM)
                 train_acc = metrics.accuracy_score(np.array(train_preds), train_labels)
                 val_acc = metrics.accuracy_score(val_preds, val_labels)
                 
@@ -179,7 +289,7 @@ if __name__ == "__main__":
                 logger.info('Validation Accuracy: %f' % val_acc)
                 logger.info('-----------------------')
     
-        test_preds = model.predict(testS, testQ, get_temporal_encoding(testS, random_time=0.0), linear_start)
+        test_preds = model.predict(testS, testQ, get_temporal_encoding(testS, random_time=0.0), linear_start, testM)
         test_acc = metrics.accuracy_score(test_preds, test_labels)
         logger.info(" ".join(sys.argv))
         logger.info("Last Training Accuracy: %f" % last_train_acc)
